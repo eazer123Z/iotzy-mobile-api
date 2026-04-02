@@ -8,6 +8,568 @@ function iotzyMobileJsonResponseStatus(array $result): int
     return (int)($result['status'] ?? (!empty($result['success']) ? 200 : 400));
 }
 
+function iotzyNormalizeScheduleDays(mixed $days): array
+{
+    $normalized = [];
+    foreach ((array)$days as $day) {
+        if (!is_numeric($day)) {
+            continue;
+        }
+        $day = (int)$day;
+        if ($day < 0 || $day > 6) {
+            continue;
+        }
+        $normalized[$day] = $day;
+    }
+    return array_values($normalized);
+}
+
+function iotzyResolveOwnedDeviceIds(PDO $db, int $userId, mixed $deviceIds): array
+{
+    $deviceIds = array_values(array_unique(array_map(
+        'intval',
+        array_filter((array)$deviceIds, static fn($id) => is_numeric($id) && (int)$id > 0)
+    )));
+    if (!$deviceIds) {
+        return [];
+    }
+
+    $placeholders = implode(',', array_fill(0, count($deviceIds), '?'));
+    $stmt = $db->prepare("SELECT id FROM devices WHERE user_id = ? AND id IN ($placeholders)");
+    $stmt->execute(array_merge([$userId], $deviceIds));
+    return array_map('intval', $stmt->fetchAll(PDO::FETCH_COLUMN));
+}
+
+function iotzyMobileGetDeviceTemplates(PDO $db): array
+{
+    return [
+        'success' => true,
+        'templates' => getUserDeviceTemplates($db),
+    ];
+}
+
+function iotzyMobileGetSensorTemplates(PDO $db): array
+{
+    return [
+        'success' => true,
+        'templates' => getUserSensorTemplates($db),
+    ];
+}
+
+function iotzyMobileAddDevice(PDO $db, int $userId, array $body): array
+{
+    $name = trim((string)($body['name'] ?? ''));
+    if ($name === '') {
+        return ['success' => false, 'status' => 422, 'error' => 'Nama perangkat tidak boleh kosong'];
+    }
+
+    $template = resolveDeviceTemplate(
+        $db,
+        $body['device_template_id'] ?? null,
+        $body['template_slug'] ?? null,
+        $body['type'] ?? null,
+        $body['icon'] ?? null
+    );
+
+    $type = trim((string)($body['type'] ?? ''));
+    if ($type === '') {
+        $type = $template['device_type'] ?? 'switch';
+    }
+    $icon = trim((string)($body['icon'] ?? ''));
+    if ($icon === '') {
+        $icon = $template['default_icon'] ?? 'fa-plug';
+    }
+
+    $stateOnLabel = trim((string)($body['state_on_label'] ?? ($template['state_on_label'] ?? '')));
+    $stateOffLabel = trim((string)($body['state_off_label'] ?? ($template['state_off_label'] ?? '')));
+    $topicSub = trim((string)($body['topic_sub'] ?? ''));
+    $topicPub = trim((string)($body['topic_pub'] ?? ''));
+    $controlValue = array_key_exists('control_value', $body) && $body['control_value'] !== ''
+        ? (float)$body['control_value']
+        : null;
+    $controlText = trim((string)($body['control_text'] ?? ''));
+
+    $deviceKeyBase = preg_replace('/[^a-z0-9_]+/i', '_', strtolower($name)) ?: 'device';
+    $deviceKey = $deviceKeyBase . '_' . substr(bin2hex(random_bytes(4)), 0, 8);
+
+    $newId = dbInsert(
+        "INSERT INTO devices (
+            user_id, device_template_id, device_key, name, icon, type, topic_sub, topic_pub,
+            control_value, control_text, state_on_label, state_off_label
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            $userId,
+            $template['id'] ?? null,
+            $deviceKey,
+            $name,
+            $icon,
+            $type,
+            $topicSub !== '' ? $topicSub : null,
+            $topicPub !== '' ? $topicPub : null,
+            $controlValue,
+            $controlText !== '' ? $controlText : null,
+            $stateOnLabel !== '' ? $stateOnLabel : null,
+            $stateOffLabel !== '' ? $stateOffLabel : null,
+        ]
+    );
+
+    addActivityLog(
+        $userId,
+        $name,
+        'Perangkat baru ditambahkan',
+        'Mobile',
+        'success',
+        $newId,
+        null,
+        ['template_slug' => $template['slug'] ?? null, 'type' => $type]
+    );
+
+    return [
+        'success' => true,
+        'status' => 200,
+        'id' => $newId,
+        'device_key' => $deviceKey,
+        'message' => 'Perangkat berhasil ditambahkan',
+    ];
+}
+
+function iotzyMobileUpdateDevice(PDO $db, int $userId, array $body): array
+{
+    $deviceId = (int)($body['id'] ?? 0);
+    $name = trim((string)($body['name'] ?? ''));
+    if ($deviceId <= 0 || $name === '') {
+        return ['success' => false, 'status' => 422, 'error' => 'ID atau nama perangkat tidak valid'];
+    }
+
+    $stmt = $db->prepare("SELECT * FROM devices WHERE id = ? AND user_id = ? LIMIT 1");
+    $stmt->execute([$deviceId, $userId]);
+    $existing = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$existing) {
+        return ['success' => false, 'status' => 404, 'error' => 'Perangkat tidak ditemukan'];
+    }
+
+    $template = resolveDeviceTemplate(
+        $db,
+        $body['device_template_id'] ?? $existing['device_template_id'] ?? null,
+        $body['template_slug'] ?? null,
+        $body['type'] ?? $existing['type'] ?? null,
+        $body['icon'] ?? $existing['icon'] ?? null
+    );
+
+    $type = trim((string)($body['type'] ?? $existing['type'] ?? ''));
+    if ($type === '') {
+        $type = $template['device_type'] ?? 'switch';
+    }
+    $icon = trim((string)($body['icon'] ?? $existing['icon'] ?? ''));
+    if ($icon === '') {
+        $icon = $template['default_icon'] ?? 'fa-plug';
+    }
+
+    $topicSub = trim((string)($body['topic_sub'] ?? $existing['topic_sub'] ?? ''));
+    $topicPub = trim((string)($body['topic_pub'] ?? $existing['topic_pub'] ?? ''));
+    $controlValue = array_key_exists('control_value', $body) && $body['control_value'] !== ''
+        ? (float)$body['control_value']
+        : ($existing['control_value'] !== null ? (float)$existing['control_value'] : null);
+    $controlText = trim((string)($body['control_text'] ?? $existing['control_text'] ?? ''));
+    $stateOnLabel = trim((string)($body['state_on_label'] ?? $existing['state_on_label'] ?? ($template['state_on_label'] ?? '')));
+    $stateOffLabel = trim((string)($body['state_off_label'] ?? $existing['state_off_label'] ?? ($template['state_off_label'] ?? '')));
+
+    dbWrite(
+        "UPDATE devices
+         SET device_template_id = ?, name = ?, icon = ?, type = ?, topic_sub = ?, topic_pub = ?,
+             control_value = ?, control_text = ?, state_on_label = ?, state_off_label = ?
+         WHERE id = ? AND user_id = ?",
+        [
+            $template['id'] ?? null,
+            $name,
+            $icon,
+            $type,
+            $topicSub !== '' ? $topicSub : null,
+            $topicPub !== '' ? $topicPub : null,
+            $controlValue,
+            $controlText !== '' ? $controlText : null,
+            $stateOnLabel !== '' ? $stateOnLabel : null,
+            $stateOffLabel !== '' ? $stateOffLabel : null,
+            $deviceId,
+            $userId,
+        ]
+    );
+
+    addActivityLog(
+        $userId,
+        $name,
+        'Konfigurasi perangkat diperbarui',
+        'Mobile',
+        'info',
+        $deviceId,
+        null,
+        ['template_slug' => $template['slug'] ?? null, 'type' => $type]
+    );
+
+    return ['success' => true, 'status' => 200, 'message' => 'Perangkat berhasil diperbarui'];
+}
+
+function iotzyMobileDeleteDevice(PDO $db, int $userId, array $body): array
+{
+    $deviceId = (int)($body['id'] ?? 0);
+    if ($deviceId <= 0) {
+        return ['success' => false, 'status' => 422, 'error' => 'ID perangkat tidak valid'];
+    }
+    $stmt = $db->prepare("SELECT name FROM devices WHERE id = ? AND user_id = ?");
+    $stmt->execute([$deviceId, $userId]);
+    $device = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$device) {
+        return ['success' => false, 'status' => 404, 'error' => 'Perangkat tidak ditemukan'];
+    }
+
+    dbWrite("DELETE FROM devices WHERE id = ? AND user_id = ?", [$deviceId, $userId]);
+    addActivityLog($userId, $device['name'], 'Perangkat telah dihapus dari sistem', 'Mobile', 'warning', $deviceId);
+
+    return ['success' => true, 'status' => 200, 'message' => 'Perangkat berhasil dihapus'];
+}
+
+function iotzyMobileAddSensor(PDO $db, int $userId, array $body): array
+{
+    $name = trim((string)($body['name'] ?? ''));
+    $topic = trim((string)($body['topic'] ?? ''));
+    if ($name === '' || $topic === '') {
+        return ['success' => false, 'status' => 422, 'error' => 'Nama sensor dan topic MQTT harus diisi'];
+    }
+
+    $template = resolveSensorTemplate(
+        $db,
+        $body['sensor_template_id'] ?? null,
+        $body['template_slug'] ?? null,
+        $body['type'] ?? $body['sensor_type'] ?? null
+    );
+
+    $type = trim((string)($body['type'] ?? $body['sensor_type'] ?? ''));
+    if ($type === '') {
+        $type = $template['sensor_type'] ?? 'temperature';
+    }
+
+    $unit = trim((string)($body['unit'] ?? ''));
+    if ($unit === '') {
+        $unit = (string)($template['default_unit'] ?? '');
+    }
+
+    $icon = trim((string)($body['icon'] ?? ''));
+    if ($icon === '') {
+        $icon = (string)($template['default_icon'] ?? 'fa-microchip');
+    }
+
+    $deviceId = isset($body['device_id']) && $body['device_id'] !== '' ? (int)$body['device_id'] : null;
+    if ($deviceId) {
+        $stmt = $db->prepare("SELECT id FROM devices WHERE id = ? AND user_id = ? LIMIT 1");
+        $stmt->execute([$deviceId, $userId]);
+        if (!$stmt->fetch()) {
+            $deviceId = null;
+        }
+    }
+
+    $sensorKeyBase = preg_replace('/[^a-z0-9_]+/i', '_', strtolower($name)) ?: 'sensor';
+    $sensorKey = $sensorKeyBase . '_' . substr(bin2hex(random_bytes(4)), 0, 8);
+
+    $newId = dbInsert(
+        "INSERT INTO sensors (
+            user_id, device_id, sensor_template_id, sensor_key, name, type, icon, unit, topic
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            $userId,
+            $deviceId,
+            $template['id'] ?? null,
+            $sensorKey,
+            $name,
+            $type,
+            $icon,
+            $unit !== '' ? $unit : null,
+            $topic,
+        ]
+    );
+
+    addActivityLog(
+        $userId,
+        $name,
+        'Sensor baru ditambahkan',
+        'Mobile',
+        'success',
+        $deviceId,
+        $newId,
+        ['template_slug' => $template['slug'] ?? null, 'type' => $type]
+    );
+
+    return [
+        'success' => true,
+        'status' => 200,
+        'id' => $newId,
+        'sensor_key' => $sensorKey,
+        'message' => 'Sensor berhasil disimpan',
+    ];
+}
+
+function iotzyMobileUpdateSensor(PDO $db, int $userId, array $body): array
+{
+    $sensorId = (int)($body['id'] ?? 0);
+    $name = trim((string)($body['name'] ?? ''));
+    $topic = trim((string)($body['topic'] ?? ''));
+    if ($sensorId <= 0 || $name === '' || $topic === '') {
+        return ['success' => false, 'status' => 422, 'error' => 'Data input sensor tidak lengkap'];
+    }
+
+    $stmt = $db->prepare("SELECT * FROM sensors WHERE id = ? AND user_id = ? LIMIT 1");
+    $stmt->execute([$sensorId, $userId]);
+    $existing = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$existing) {
+        return ['success' => false, 'status' => 404, 'error' => 'Sensor tidak ditemukan'];
+    }
+
+    $template = resolveSensorTemplate(
+        $db,
+        $body['sensor_template_id'] ?? $existing['sensor_template_id'] ?? null,
+        $body['template_slug'] ?? null,
+        $body['type'] ?? $body['sensor_type'] ?? $existing['type'] ?? null
+    );
+
+    $type = trim((string)($body['type'] ?? $body['sensor_type'] ?? $existing['type'] ?? ''));
+    if ($type === '') {
+        $type = $template['sensor_type'] ?? 'temperature';
+    }
+
+    $unit = trim((string)($body['unit'] ?? $existing['unit'] ?? ''));
+    if ($unit === '') {
+        $unit = (string)($template['default_unit'] ?? '');
+    }
+
+    $icon = trim((string)($body['icon'] ?? $existing['icon'] ?? ''));
+    if ($icon === '') {
+        $icon = (string)($template['default_icon'] ?? 'fa-microchip');
+    }
+
+    $deviceId = array_key_exists('device_id', $body)
+        ? (($body['device_id'] !== '' && $body['device_id'] !== null) ? (int)$body['device_id'] : null)
+        : ($existing['device_id'] !== null ? (int)$existing['device_id'] : null);
+    if ($deviceId) {
+        $devStmt = $db->prepare("SELECT id FROM devices WHERE id = ? AND user_id = ? LIMIT 1");
+        $devStmt->execute([$deviceId, $userId]);
+        if (!$devStmt->fetch()) {
+            $deviceId = null;
+        }
+    }
+
+    dbWrite(
+        "UPDATE sensors
+         SET device_id = ?, sensor_template_id = ?, name = ?, type = ?, icon = ?, unit = ?, topic = ?
+         WHERE id = ? AND user_id = ?",
+        [
+            $deviceId,
+            $template['id'] ?? null,
+            $name,
+            $type,
+            $icon,
+            $unit !== '' ? $unit : null,
+            $topic,
+            $sensorId,
+            $userId,
+        ]
+    );
+
+    addActivityLog(
+        $userId,
+        $name,
+        'Konfigurasi sensor diperbarui',
+        'Mobile',
+        'info',
+        $deviceId,
+        $sensorId,
+        ['template_slug' => $template['slug'] ?? null, 'type' => $type]
+    );
+
+    return ['success' => true, 'status' => 200, 'message' => 'Sensor berhasil diperbarui'];
+}
+
+function iotzyMobileDeleteSensor(PDO $db, int $userId, array $body): array
+{
+    $sensorId = (int)($body['id'] ?? 0);
+    if ($sensorId <= 0) {
+        return ['success' => false, 'status' => 422, 'error' => 'ID sensor tidak valid'];
+    }
+    $stmt = $db->prepare("SELECT name, device_id FROM sensors WHERE id = ? AND user_id = ?");
+    $stmt->execute([$sensorId, $userId]);
+    $sensor = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$sensor) {
+        return ['success' => false, 'status' => 404, 'error' => 'Sensor tidak ditemukan'];
+    }
+
+    dbWrite("DELETE FROM sensors WHERE id = ? AND user_id = ?", [$sensorId, $userId]);
+    addActivityLog(
+        $userId,
+        $sensor['name'],
+        'Sensor telah dihapus',
+        'Mobile',
+        'warning',
+        $sensor['device_id'] ? (int)$sensor['device_id'] : null,
+        $sensorId
+    );
+
+    return ['success' => true, 'status' => 200, 'message' => 'Sensor berhasil dihapus'];
+}
+
+function iotzyMobileAddAutomationRule(PDO $db, int $userId, array $body): array
+{
+    $sensorId = (int)($body['sensor_id'] ?? 0);
+    $deviceId = (int)($body['device_id'] ?? 0);
+    $condition = trim((string)($body['condition'] ?? $body['condition_type'] ?? ''));
+    $action = trim((string)($body['action'] ?? 'on'));
+    $delay = max(0, (int)($body['delay'] ?? $body['delay_ms'] ?? 0));
+    $allowedConditions = ['gt', 'lt', 'range', 'between', 'detected', 'absent', 'time_only'];
+    $allowedActions = ['on', 'off', 'speed_high', 'speed_mid', 'speed_low', 'toggle'];
+
+    if ($deviceId <= 0 || !in_array($condition, $allowedConditions, true)) {
+        return ['success' => false, 'status' => 422, 'error' => 'Konfigurasi aturan tidak valid'];
+    }
+    if ($condition !== 'time_only' && $sensorId <= 0) {
+        return ['success' => false, 'status' => 422, 'error' => 'Tentukan sensor sebagai pemicu'];
+    }
+    if (!in_array($action, $allowedActions, true)) {
+        $action = 'on';
+    }
+
+    if ($sensorId > 0) {
+        $sensorStmt = $db->prepare("SELECT id FROM sensors WHERE id = ? AND user_id = ?");
+        $sensorStmt->execute([$sensorId, $userId]);
+        if (!$sensorStmt->fetch()) {
+            return ['success' => false, 'status' => 404, 'error' => 'Sensor tidak terdaftar'];
+        }
+    }
+
+    $deviceStmt = $db->prepare("SELECT id FROM devices WHERE id = ? AND user_id = ?");
+    $deviceStmt->execute([$deviceId, $userId]);
+    if (!$deviceStmt->fetch()) {
+        return ['success' => false, 'status' => 404, 'error' => 'Perangkat tidak terdaftar'];
+    }
+
+    $threshold = isset($body['threshold']) && $body['threshold'] !== '' ? (float)$body['threshold'] : null;
+    $thresholdMin = isset($body['threshold_min']) && $body['threshold_min'] !== '' ? (float)$body['threshold_min'] : null;
+    $thresholdMax = isset($body['threshold_max']) && $body['threshold_max'] !== '' ? (float)$body['threshold_max'] : null;
+    $days = array_key_exists('days', $body) ? iotzyNormalizeScheduleDays($body['days']) : [];
+    $startTime = !empty($body['start_time']) ? trim((string)$body['start_time']) : null;
+    $endTime = !empty($body['end_time']) ? trim((string)$body['end_time']) : null;
+    $fromTemplate = trim((string)($body['from_template'] ?? ''));
+
+    if (in_array($condition, ['range', 'between'], true) &&
+        $thresholdMin !== null && $thresholdMax !== null && $thresholdMin >= $thresholdMax) {
+        return ['success' => false, 'status' => 422, 'error' => 'Batas minimal harus lebih kecil dari maksimal'];
+    }
+
+    $newId = dbInsert(
+        "INSERT INTO automation_rules (
+            user_id, sensor_id, device_id, condition_type, threshold, threshold_min, threshold_max,
+            action, delay_ms, start_time, end_time, days, from_template
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            $userId,
+            $sensorId ?: null,
+            $deviceId,
+            $condition,
+            $threshold,
+            $thresholdMin,
+            $thresholdMax,
+            $action,
+            $delay,
+            $startTime,
+            $endTime,
+            $days ? json_encode($days) : null,
+            $fromTemplate !== '' ? $fromTemplate : null,
+        ]
+    );
+
+    addActivityLog($userId, 'Otomasi', 'Aturan baru berhasil dibuat', 'Mobile', 'success');
+
+    return [
+        'success' => true,
+        'status' => 200,
+        'id' => $newId,
+        'message' => 'Aturan berhasil ditambahkan',
+    ];
+}
+
+function iotzyMobileDeleteAutomationRule(PDO $db, int $userId, array $body): array
+{
+    $ruleId = (int)($body['id'] ?? 0);
+    if ($ruleId <= 0) {
+        return ['success' => false, 'status' => 422, 'error' => 'ID aturan tidak valid'];
+    }
+    $stmt = $db->prepare("SELECT id FROM automation_rules WHERE id = ? AND user_id = ?");
+    $stmt->execute([$ruleId, $userId]);
+    if (!$stmt->fetch()) {
+        return ['success' => false, 'status' => 404, 'error' => 'Aturan tidak ditemukan'];
+    }
+    dbWrite("DELETE FROM automation_rules WHERE id = ? AND user_id = ?", [$ruleId, $userId]);
+    addActivityLog($userId, 'Otomasi', 'Aturan telah dihapus', 'Mobile', 'warning');
+    return ['success' => true, 'status' => 200, 'message' => 'Aturan berhasil dihapus'];
+}
+
+function iotzyMobileAddSchedule(PDO $db, int $userId, array $body): array
+{
+    $time = trim((string)($body['time_hhmm'] ?? $body['time'] ?? ''));
+    $days = iotzyNormalizeScheduleDays($body['days'] ?? []);
+    $devices = iotzyResolveOwnedDeviceIds($db, $userId, $body['devices'] ?? []);
+    $action = trim((string)($body['action'] ?? 'on'));
+    $label = trim((string)($body['label'] ?? ''));
+
+    if (!preg_match('/^\d{2}:\d{2}$/', $time)) {
+        return ['success' => false, 'status' => 422, 'error' => 'Format waktu harus HH:MM'];
+    }
+    if (!$devices) {
+        return ['success' => false, 'status' => 422, 'error' => 'Pilih minimal satu perangkat'];
+    }
+    if (!in_array($action, ['on', 'off', 'toggle'], true)) {
+        $action = 'on';
+    }
+
+    $newId = dbInsert(
+        "INSERT INTO schedules (user_id, label, time_hhmm, days, action, devices)
+         VALUES (?, ?, ?, ?, ?, ?)",
+        [$userId, $label !== '' ? $label : null, $time, json_encode($days), $action, json_encode($devices)]
+    );
+    addActivityLog($userId, 'Jadwal', 'Penjadwalan baru: ' . $time, 'Mobile', 'success');
+    return ['success' => true, 'status' => 200, 'id' => $newId, 'message' => 'Jadwal berhasil disimpan'];
+}
+
+function iotzyMobileDeleteSchedule(PDO $db, int $userId, array $body): array
+{
+    $scheduleId = (int)($body['id'] ?? $body['schedule_id'] ?? 0);
+    if ($scheduleId <= 0) {
+        return ['success' => false, 'status' => 422, 'error' => 'ID jadwal tidak valid'];
+    }
+    $stmt = $db->prepare("SELECT id FROM schedules WHERE id = ? AND user_id = ?");
+    $stmt->execute([$scheduleId, $userId]);
+    if (!$stmt->fetch()) {
+        return ['success' => false, 'status' => 404, 'error' => 'Jadwal tidak ditemukan'];
+    }
+    dbWrite("DELETE FROM schedules WHERE id = ? AND user_id = ?", [$scheduleId, $userId]);
+    return ['success' => true, 'status' => 200, 'message' => 'Jadwal berhasil dihapus'];
+}
+
+function iotzyMobileSaveCvRules(PDO $db, int $userId, array $body): array
+{
+    $bundle = getUserCameraBundle($userId, $db, $body);
+    $cameraId = (int)($bundle['camera']['id'] ?? 0);
+    $rules = $body['rules'] ?? null;
+    if (!is_array($rules) || $cameraId <= 0) {
+        return ['success' => false, 'status' => 422, 'error' => 'Data rules CV tidak valid'];
+    }
+    $saved = iotzyPersistCvRules(
+        $db,
+        $userId,
+        $cameraId,
+        $rules,
+        getUserSettings($userId) ?? [],
+        $bundle['camera_settings'] ?? []
+    );
+    return ['success' => true, 'status' => 200, 'rules' => $saved];
+}
+
 function iotzyMobileToggleDevice(PDO $db, int $userId, array $body): array
 {
     $deviceId = (int)($body['id'] ?? $body['device_id'] ?? 0);
@@ -390,8 +952,58 @@ function handleMobileAction(string $action, array $body, PDO $db): void
         jsonOut(['success' => true, 'devices' => getUserDevicesClientPayload($userId, $db)]);
     }
 
+    if ($action === 'mobile_device_templates') {
+        jsonOut(iotzyMobileGetDeviceTemplates($db));
+    }
+
+    if ($action === 'mobile_add_device') {
+        $result = iotzyMobileAddDevice($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_update_device') {
+        $result = iotzyMobileUpdateDevice($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_delete_device') {
+        $result = iotzyMobileDeleteDevice($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
     if ($action === 'mobile_sensors') {
         jsonOut(['success' => true, 'sensors' => getUserSensorsClientPayload($userId, $db)]);
+    }
+
+    if ($action === 'mobile_sensor_templates') {
+        jsonOut(iotzyMobileGetSensorTemplates($db));
+    }
+
+    if ($action === 'mobile_add_sensor') {
+        $result = iotzyMobileAddSensor($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_update_sensor') {
+        $result = iotzyMobileUpdateSensor($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_delete_sensor') {
+        $result = iotzyMobileDeleteSensor($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
     }
 
     if ($action === 'mobile_logs') {
@@ -432,8 +1044,22 @@ function handleMobileAction(string $action, array $body, PDO $db): void
         jsonOut(iotzyMobileGetAutomationRules($db, $userId));
     }
 
+    if ($action === 'mobile_add_automation_rule') {
+        $result = iotzyMobileAddAutomationRule($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
     if ($action === 'mobile_toggle_automation_rule') {
         $result = iotzyMobileToggleAutomationRule($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_delete_automation_rule') {
+        $result = iotzyMobileDeleteAutomationRule($db, $userId, $body);
         $status = iotzyMobileJsonResponseStatus($result);
         unset($result['status']);
         jsonOut($result, $status);
@@ -443,8 +1069,22 @@ function handleMobileAction(string $action, array $body, PDO $db): void
         jsonOut(iotzyMobileGetSchedules($db, $userId));
     }
 
+    if ($action === 'mobile_add_schedule') {
+        $result = iotzyMobileAddSchedule($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
     if ($action === 'mobile_toggle_schedule') {
         $result = iotzyMobileToggleSchedule($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_delete_schedule') {
+        $result = iotzyMobileDeleteSchedule($db, $userId, $body);
         $status = iotzyMobileJsonResponseStatus($result);
         unset($result['status']);
         jsonOut($result, $status);
@@ -453,6 +1093,13 @@ function handleMobileAction(string $action, array $body, PDO $db): void
     if ($action === 'mobile_cv_rules') {
         $bundle = getUserCameraBundle($userId, $db, $body);
         jsonOut(['success' => true, 'rules' => $bundle['camera_settings']['cv_rules'] ?? iotzyDefaultCvRules()]);
+    }
+
+    if ($action === 'mobile_save_cv_rules') {
+        $result = iotzyMobileSaveCvRules($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
     }
 
     if ($action === 'mobile_cv_config') {
@@ -480,6 +1127,42 @@ function handleMobileAction(string $action, array $body, PDO $db): void
 
     if ($action === 'mobile_camera_stream_sessions') {
         jsonOut(['success' => true, 'sessions' => getUserCameraStreamSessions($userId, $body, $db)]);
+    }
+
+    if ($action === 'mobile_start_camera_stream') {
+        $result = startUserCameraStreamSession($userId, $body, $body, $db);
+        jsonOut($result, !empty($result['success']) ? 200 : 400);
+    }
+
+    if ($action === 'mobile_join_camera_stream') {
+        $streamKey = trim((string)($body['stream_key'] ?? ''));
+        $result = joinUserCameraStreamSession($userId, $body, $streamKey, $db);
+        jsonOut($result, !empty($result['success']) ? 200 : 400);
+    }
+
+    if ($action === 'mobile_submit_camera_stream_answer') {
+        $streamKey = trim((string)($body['stream_key'] ?? ''));
+        $result = submitUserCameraStreamAnswer($userId, $body, $streamKey, $body['answer_sdp'] ?? '', $db);
+        jsonOut($result, !empty($result['success']) ? 200 : 400);
+    }
+
+    if ($action === 'mobile_push_camera_stream_candidate') {
+        $streamKey = trim((string)($body['stream_key'] ?? ''));
+        $result = pushUserCameraStreamCandidate($userId, $body, $streamKey, $body['candidate'] ?? null, $db);
+        jsonOut($result, !empty($result['success']) ? 200 : 400);
+    }
+
+    if ($action === 'mobile_poll_camera_stream_updates') {
+        $streamKey = trim((string)($body['stream_key'] ?? ''));
+        $lastCandidateId = max(0, (int)($body['last_candidate_id'] ?? 0));
+        $result = pollUserCameraStreamUpdates($userId, $body, $streamKey, $lastCandidateId, $db);
+        jsonOut($result, !empty($result['success']) ? 200 : 400);
+    }
+
+    if ($action === 'mobile_stop_camera_stream') {
+        $streamKey = trim((string)($body['stream_key'] ?? ''));
+        $result = stopUserCameraStreamSession($userId, $body, $streamKey, $db);
+        jsonOut($result, !empty($result['success']) ? 200 : 400);
     }
 
     if ($action === 'mobile_toggle_device') {
