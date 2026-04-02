@@ -7,11 +7,11 @@ function getLocalDB(): ?PDO {
     if ($pdo !== null) return ($pdo instanceof PDO) ? $pdo : null;
 
     try {
-        $h = getenv('MYSQL_HOST');
-        $port = getenv('MYSQL_PORT') ?: '3306';
-        $d = getenv('MYSQL_DATABASE');
-        $u = getenv('MYSQL_USER');
-        $p = getenv('MYSQL_PASSWORD') ?: getenv('MYSQL_PASS') ?: '';
+        $h = trim((string)(getenv('MYSQL_HOST') ?: ''));
+        $port = trim((string)(getenv('MYSQL_PORT') ?: '3306'));
+        $d = trim((string)(getenv('MYSQL_DATABASE') ?: ''));
+        $u = trim((string)(getenv('MYSQL_USER') ?: ''));
+        $p = trim((string)(getenv('MYSQL_PASSWORD') ?: getenv('MYSQL_PASS') ?: ''));
 
         if (!$h || !$d || !$u) {
             throw new Exception("Konfigurasi database (ENV) tidak lengkap!");
