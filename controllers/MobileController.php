@@ -2,10 +2,165 @@
 
 require_once __DIR__ . '/../bootstrap.php';
 require_once __DIR__ . '/../core/mobile_auth.php';
+require_once __DIR__ . '/../core/AIParser.php';
 
 function iotzyMobileJsonResponseStatus(array $result): int
 {
     return (int)($result['status'] ?? (!empty($result['success']) ? 200 : 400));
+}
+
+function iotzyMobileAiDefaultTokenMetrics(): array
+{
+    return [
+        'prompt_tokens' => 0,
+        'history_tokens' => 0,
+        'context_tokens' => 0,
+        'response_tokens' => 0,
+        'total_requests' => 0,
+    ];
+}
+
+function iotzyMobileNormalizeAiMessage(mixed $message): ?string
+{
+    $text = trim((string)$message);
+    if ($text === '') {
+        return null;
+    }
+    if (mb_strlen($text) > AI_CHAT_MAX_MESSAGE_LEN) {
+        return mb_substr($text, 0, AI_CHAT_MAX_MESSAGE_LEN);
+    }
+    return $text;
+}
+
+function iotzyMobileGetAiHistory(PDO $db, int $userId): array
+{
+    $stmt = $db->prepare(
+        "SELECT sender, message, platform, created_at
+         FROM ai_chat_history
+         WHERE user_id = ?
+         ORDER BY created_at ASC
+         LIMIT 50"
+    );
+    $stmt->execute([$userId]);
+    return [
+        'success' => true,
+        'history' => $stmt->fetchAll(PDO::FETCH_ASSOC),
+    ];
+}
+
+function iotzyMobileGetAiTokenMetrics(PDO $db, int $userId): array
+{
+    try {
+        $stmt = $db->prepare(
+            "SELECT prompt_tokens, history_tokens, context_tokens, response_tokens, created_at
+             FROM ai_token_metrics
+             WHERE user_id = ?
+             ORDER BY created_at DESC
+             LIMIT 100"
+        );
+        $stmt->execute([$userId]);
+        $rows = array_reverse($stmt->fetchAll(PDO::FETCH_ASSOC));
+    } catch (\Throwable $e) {
+        error_log('[IoTzy Mobile AI] metrics fallback: ' . $e->getMessage());
+        return [
+            'success' => true,
+            'available' => false,
+            'summary' => iotzyMobileAiDefaultTokenMetrics(),
+            'rows' => [],
+        ];
+    }
+
+    $summary = iotzyMobileAiDefaultTokenMetrics();
+    $summary['total_requests'] = count($rows);
+    foreach ($rows as $row) {
+        $summary['prompt_tokens'] += (int)($row['prompt_tokens'] ?? 0);
+        $summary['history_tokens'] += (int)($row['history_tokens'] ?? 0);
+        $summary['context_tokens'] += (int)($row['context_tokens'] ?? 0);
+        $summary['response_tokens'] += (int)($row['response_tokens'] ?? 0);
+    }
+
+    return [
+        'success' => true,
+        'available' => true,
+        'summary' => $summary,
+        'rows' => $rows,
+    ];
+}
+
+function iotzyMobileHandleAiChat(PDO $db, int $userId, array $body): array
+{
+    $message = iotzyMobileNormalizeAiMessage($body['message'] ?? '');
+    if ($message === null) {
+        return [
+            'success' => false,
+            'status' => 422,
+            'error' => 'Pesan AI tidak boleh kosong',
+        ];
+    }
+
+    try {
+        $cvState = iotzy_validate_cv_state(
+            is_array($body['cv_state'] ?? null) ? $body['cv_state'] : null
+        );
+        $parsed = parse_nl_to_action(
+            $userId,
+            $message,
+            [],
+            [],
+            'mobile',
+            $cvState,
+            $body['session_start'] ?? null
+        );
+
+        if (empty($parsed['success'])) {
+            $parsed['status'] = 400;
+            return $parsed;
+        }
+
+        $parsed['data']['execution'] = execute_ai_actions(
+            $userId,
+            $parsed['data'] ?? []
+        );
+
+        return [
+            'success' => true,
+            'status' => 200,
+            'reply' => (string)($parsed['data']['response_text'] ?? ''),
+            'result' => $parsed['data'] ?? [],
+        ];
+    } catch (\Throwable $e) {
+        error_log(sprintf(
+            '[IoTzy Mobile AI] chat failed: %s in %s:%d',
+            $e->getMessage(),
+            $e->getFile(),
+            $e->getLine()
+        ));
+
+        return [
+            'success' => false,
+            'status' => 500,
+            'error' => 'AI Assistant sedang bermasalah. Coba lagi beberapa saat.',
+        ];
+    }
+}
+
+function iotzyMobileClearAiHistory(PDO $db, int $userId): array
+{
+    $stmt = $db->prepare("DELETE FROM ai_chat_history WHERE user_id = ?");
+    $stmt->execute([$userId]);
+    addActivityLog(
+        $userId,
+        'AI Assistant',
+        'Riwayat AI dibersihkan dari aplikasi mobile',
+        'Mobile',
+        'warning'
+    );
+
+    return [
+        'success' => true,
+        'status' => 200,
+        'message' => 'Riwayat AI berhasil dibersihkan',
+    ];
 }
 
 function iotzyNormalizeScheduleDays(mixed $days): array
@@ -1013,6 +1168,28 @@ function handleMobileAction(string $action, array $body, PDO $db): void
     if ($action === 'mobile_analytics') {
         $date = trim((string)($body['date'] ?? $_GET['date'] ?? date('Y-m-d')));
         jsonOut(['success' => true, 'analytics' => getDailyAnalyticsSummary($userId, $date, $db)]);
+    }
+
+    if ($action === 'mobile_ai_chat_history') {
+        jsonOut(iotzyMobileGetAiHistory($db, $userId));
+    }
+
+    if ($action === 'mobile_ai_chat_process') {
+        $result = iotzyMobileHandleAiChat($db, $userId, $body);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_ai_chat_clear') {
+        $result = iotzyMobileClearAiHistory($db, $userId);
+        $status = iotzyMobileJsonResponseStatus($result);
+        unset($result['status']);
+        jsonOut($result, $status);
+    }
+
+    if ($action === 'mobile_ai_token_metrics') {
+        jsonOut(iotzyMobileGetAiTokenMetrics($db, $userId));
     }
 
     if ($action === 'mobile_settings') {
